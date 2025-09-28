@@ -138,7 +138,7 @@ def predict_image(image_path, model, class_names):
 
 # --- 4. Main Execution Block ---
 if __name__ == "__main__":
-    test_directory = "./test"
+    test_directory = "./data/test-dataset"
 
     # Check if the test directory exists
     if not os.path.isdir(test_directory):

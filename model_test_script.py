@@ -96,39 +96,44 @@ class_names = [
 # Set the device (use GPU if available, otherwise CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Path to your trained model
-MODEL_PATH = "./models/20250928-165707-resnet9-plant-disease-classifier-model-complete.pth"
+MODEL_PATH = (
+    "./models/20250928-165707-resnet9-plant-disease-classifier-model-complete.pth"
+)
 
 
 # --- 3. Prediction Function ---
 def predict_image(image_path, model, class_names):
     """
-    Loads an image, preprocesses it, and returns the model's prediction.
+    Loads an image, preprocesses it, and returns
+    (predicted_class, [(class_name, probability_float), ...] sorted desc).
     """
     try:
-        # 1. Load Image
         image = Image.open(image_path).convert("RGB")
-
-        # 2. Define Transformations
-        # The transformations must be the same as the validation set in the notebook.
-        transform = T.Compose([T.Resize((256, 256)), T.ToTensor()])
-
-        # 3. Preprocess the image
+        transform = T.Compose(
+            [
+                T.Resize((256, 256)),  # training images were 256x256
+                T.ToTensor(),  # no normalization used during training
+            ]
+        )
         img_tensor = transform(image).unsqueeze(0).to(device)
 
-        # 4. Make Prediction
         with torch.no_grad():
-            outputs = model(img_tensor)
-            _, predicted_idx = torch.max(outputs, 1)
+            logits = model(img_tensor)
+            probs = torch.softmax(logits, dim=1).squeeze(0)  # [num_classes]
+            top_prob, predicted_idx = torch.max(probs, 0)
 
-        # 5. Get the class name
         predicted_class = class_names[predicted_idx.item()]
+        probs_list = [
+            (class_names[i], probs[i].item()) for i in range(len(class_names))
+        ]
+        probs_list.sort(key=lambda x: x[1], reverse=True)
 
-        return predicted_class
+        return predicted_class, probs_list
 
     except FileNotFoundError:
-        return f"Error: The file at {image_path} was not found."
+        return f"Error: The file at {image_path} was not found.", None
     except Exception as e:
-        return f"An error occurred: {e}"
+        return f"An error occurred: {e}", None
 
 
 # --- 4. Main Execution Block ---
@@ -179,9 +184,27 @@ if __name__ == "__main__":
     for image_file in image_files:
         image_path_to_test = os.path.join(test_directory, image_file)
 
-        # Get the prediction
-        prediction = predict_image(image_path_to_test, model, class_names)
+        # Get the prediction and probabilities
+        prediction, probs_list = predict_image(image_path_to_test, model, class_names)
+
+        if probs_list is None:
+            print(f"Image: {image_file}")
+            print(prediction)
+            print("-" * 30)
+            continue
 
         print(f"Image: {image_file}")
-        print(f"Predicted Disease: {prediction}")
+        print(f"Top-1 prediction: {prediction}  | confidence: {probs_list[0][1]:.2%}")
+        print("Per-class confidence (>= 1%):")
+        header = f"{'#':>3}  {'confidence':>12}  class"
+        print(header)
+        print("-" * len(header))
+        shown = False
+        for rank, (cls, p) in enumerate(probs_list, start=1):
+            if p < 0.01:  # hide confidences under 1%
+                continue
+            print(f"{rank:>3}  {p:>10.2%}  {cls}")
+            shown = True
+        if not shown:
+            print("  (none >= 1%)")
         print("-" * 30)

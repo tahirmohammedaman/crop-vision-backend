@@ -1,0 +1,12 @@
+{
+  "architecture": "ResNet9",
+  "input_size": [256, 256, 3],
+  "train_dataset": "PlantVillage",
+  "classes": 38,
+  "epochs": 20,
+  "optimizer": "Adam",
+  "loss": "CrossEntropyLoss",
+  "train_accuracy": 0.98,
+  "val_accuracy": 0.96,
+  "notes": "Trained on 256x256 RGB, no normalization"
+}

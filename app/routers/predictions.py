@@ -58,3 +58,61 @@ def predict(
         probabilities=[float(p) for p in probs],
         image_url=f"/media/{rel_path}",
     )
+
+
+@router.post("/predictions/{prediction_id}/feedback")
+def feedback(
+    prediction_id: int,
+    data: FeedbackRequest,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    ev = db.query(PredictionEvent).filter(PredictionEvent.id == prediction_id).first()
+    if not ev:
+        raise HTTPException(status_code=404, detail="Prediction not found")
+    if data.is_correct:
+        ev.confirmed = True
+        ev.corrected_label = None
+    else:
+        if not data.corrected_label:
+            raise HTTPException(
+                status_code=400, detail="corrected_label required when is_correct=false"
+            )
+        if data.corrected_label not in inference.class_names:
+            raise HTTPException(
+                status_code=400, detail="corrected_label not in class list"
+            )
+        ev.confirmed = True
+        ev.corrected_label = data.corrected_label
+    ev.confirmed_at = datetime.utcnow()
+    db.add(ev)
+    db.commit()
+    return JSONResponse({"status": "ok"})
+
+
+@router.get("/history", response_model=List[PredictionHistoryItem])
+def history(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    q = (
+        db.query(PredictionEvent)
+        .order_by(PredictionEvent.id.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+    return [
+        PredictionHistoryItem(
+            id=ev.id,
+            created_at=ev.created_at,
+            predicted_label=ev.predicted_label,
+            predicted_confidence=ev.predicted_confidence,
+            corrected_label=ev.corrected_label,
+            confirmed=ev.confirmed,
+            image_url=f"/media/{ev.image_path}",
+        )
+        for ev in q
+    ]

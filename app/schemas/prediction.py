@@ -1,6 +1,9 @@
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, List, Generic, TypeVar
 from pydantic import BaseModel, Field
+from pydantic.generics import GenericModel
+
+T = TypeVar("T")
 
 
 class PredictionResponse(BaseModel):
@@ -8,7 +11,7 @@ class PredictionResponse(BaseModel):
     predicted_class: str
     confidence: float
     classes: List[str]
-    probabilities: List[float]  # aligned with classes
+    probabilities: List[float]
     image_url: str
 
 
@@ -20,6 +23,13 @@ class PredictionHistoryItem(BaseModel):
     corrected_label: Optional[str] = None
     confirmed: Optional[bool] = None
     image_url: str
+    crop: str
+    tags: List[str] = Field(default_factory=list)
+
+
+class PaginatedResponse(GenericModel, Generic[T]):
+    total: int
+    items: List[T]
 
 
 class FeedbackRequest(BaseModel):

@@ -1,9 +1,10 @@
 from datetime import datetime
-from typing import Optional, List, Generic, TypeVar
+from typing import Optional, List, Generic, TypeVar, Literal
 from pydantic import BaseModel, Field
 from pydantic.generics import GenericModel
 
 T = TypeVar("T")
+OriginLiteral = Literal["server_web", "server_edge", "device_offline"]
 
 
 class PredictionResponse(BaseModel):
@@ -13,6 +14,10 @@ class PredictionResponse(BaseModel):
     classes: List[str]
     probabilities: List[float]
     image_url: str
+    origin: OriginLiteral
+    device_id: Optional[str] = None
+    device_local_timestamp: Optional[datetime] = None
+    tags: List[str] = Field(default_factory=list)
 
 
 class PredictionHistoryItem(BaseModel):
@@ -25,6 +30,9 @@ class PredictionHistoryItem(BaseModel):
     image_url: str
     crop: str
     tags: List[str] = Field(default_factory=list)
+    origin: OriginLiteral
+    device_id: Optional[str] = None
+    device_local_timestamp: Optional[datetime] = None
 
 
 class PaginatedResponse(GenericModel, Generic[T]):

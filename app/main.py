@@ -9,13 +9,17 @@ from .routers import auth as auth_router
 from .routers import predictions as predictions_router
 from .routers import stats as stats_router
 from .routers import model_info as model_info_router
+from .routers import catalog as catalog_router
+from .routers import devices as devices_router
 from .services.auth import get_password_hash
 from .services import inference
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title=settings.app_name)
+    app = FastAPI(
+        title=settings.app_name, swagger_ui_parameters={"persistAuthorization": True}
+    )
 
     app.add_middleware(
         CORSMiddleware,
@@ -34,7 +38,7 @@ def create_app() -> FastAPI:
 
     # Seed admin if not exists
     SessionLocal = get_sessionmaker(settings.database_url)
-    with SessionLocal() as db:  # type: Session
+    with SessionLocal() as db:
         if not db.query(User).filter(User.username == settings.admin_username).first():
             db.add(
                 User(
@@ -54,6 +58,8 @@ def create_app() -> FastAPI:
     app.include_router(predictions_router.router)
     app.include_router(stats_router.router)
     app.include_router(model_info_router.router)
+    app.include_router(catalog_router.router)
+    app.include_router(devices_router.router)
     return app
 
 

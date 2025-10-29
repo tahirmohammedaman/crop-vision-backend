@@ -1,28 +1,37 @@
-from datetime import datetime
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import List, Optional, cast
+import json
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Form
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_
+from sqlalchemy import or_
 from PIL import Image
 import os
 import re
 
-from ..services.auth import get_db, get_current_user
+from ..services.auth import (
+    get_db,
+    get_current_user,
+    get_current_user_optional,
+)
+from ..services.device_auth import get_current_device_optional, require_device
 from ..services.storage import save_upload
 from ..services import inference
 from ..core.config import get_settings
 from ..models.prediction import PredictionEvent
+from ..models.device import Device
 from ..schemas.prediction import (
     PredictionResponse,
     PredictionHistoryItem,
     FeedbackRequest,
     PaginatedResponse,
+    OriginLiteral,
 )
 
 router = APIRouter(prefix="/v1", tags=["predictions"])
 
-TAG_CLEAN_RE = re.compile(r"[^a-z0-9\-]+")
+TAG_CLEAN_RE = re.compile(r"[^a-z0-9\-:]+")
+ALLOWED_ORIGINS = {"server_web", "server_edge", "device_offline"}
 
 def normalize_tag(s: str) -> str:
     if s is None:
@@ -45,21 +54,72 @@ def parse_crop_disease(label: str) -> tuple[Optional[str], Optional[str]]:
         crop, disease = None, label
     return crop, disease
 
+
+def parse_device_timestamp(value: Optional[str], field_name: str = "device_local_timestamp") -> Optional[datetime]:
+    if not value:
+        return None
+    ts_value = value.strip()
+    if not ts_value:
+        return None
+    if ts_value.endswith("Z"):
+        ts_value = ts_value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(ts_value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be ISO-8601") from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def parse_probabilities_json(value: Optional[str]) -> dict[str, float]:
+    if not value:
+        return {}
+    try:
+        raw = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="probabilities_json must be valid JSON object") from exc
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="probabilities_json must be an object")
+    prob_map: dict[str, float] = {}
+    for key, val in raw.items():
+        if not isinstance(key, str):
+            raise HTTPException(status_code=400, detail="probabilities_json keys must be strings")
+        try:
+            prob_map[key] = float(val)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid probability for class '{key}'") from exc
+    return prob_map
+
+
+def ensure_model_classes(settings) -> List[str]:
+    model_path = os.path.join(settings.models_path, settings.model_file)
+    inference.ensure_loaded(model_path)
+    return getattr(inference, "class_names", []) or []
+
 @router.post("/predict", response_model=PredictionResponse)
 def predict(
     file: UploadFile = File(...),
     tags: Optional[List[str]] = Form(None, description="Optional list of tags"),
+    origin: Optional[str] = Form(
+        None,
+        description="Origin of the prediction (server_web, server_edge, device_offline)",
+    ),
+    device_id: Optional[str] = Form(None, description="Registered device identifier"),
+    device_local_timestamp: Optional[str] = Form(
+        None, description="ISO-8601 timestamp from device when prediction was made"
+    ),
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    user=Depends(get_current_user_optional),
+    device=Depends(get_current_device_optional),
 ):
     settings = get_settings()
+    classes = ensure_model_classes(settings)
     # Save upload
     rel_path = save_upload(settings.media_root, file)
     abs_path = os.path.join(settings.media_root, rel_path)
 
     # Load model and infer
-    model_path = os.path.join(settings.models_path, settings.model_file)
-    inference.ensure_loaded(model_path)
     img = Image.open(abs_path).convert("RGB")
     predicted_class, probs, top_conf, _ = inference.predict_pil(img)
 
@@ -69,28 +129,76 @@ def predict(
         # This should never happen if class names use "Crop___Disease" format
         raise HTTPException(status_code=500, detail="Unable to parse crop from predicted class")
 
+    # Determine auth context
+    if not user and not device:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    device_obj: Optional[Device] = None
+    if device:
+        if device_id and device.device_id != device_id:
+            raise HTTPException(status_code=403, detail="Device ID mismatch")
+        device_id = device.device_id
+
+    if device_id:
+        device_obj = (
+            db.query(Device)
+            .filter(Device.device_id == device_id, Device.is_active.is_(True))
+            .first()
+        )
+        if not device_obj:
+            raise HTTPException(status_code=400, detail="Unknown or inactive device_id")
+
+    resolved_origin = origin or ("server_edge" if device_obj else "server_web")
+    if resolved_origin not in ALLOWED_ORIGINS:
+        raise HTTPException(status_code=400, detail="Invalid origin value")
+
+    if resolved_origin in {"server_edge", "device_offline"}:
+        if not device_obj:
+            raise HTTPException(
+                status_code=400,
+                detail="device_id is required when origin is server_edge or device_offline",
+            )
+
+    parsed_device_ts = parse_device_timestamp(device_local_timestamp)
+
     # Normalize tags
-    norm_tags = []
+    norm_tags: list[str] = []
     if tags:
         for t in tags:
             nt = normalize_tag(t)
             if nt:
                 norm_tags.append(nt)
-        # de-duplicate
-        norm_tags = sorted(set(norm_tags))
+
+    # Auto-tags based on origin/device
+    norm_tags.append(normalize_tag(f"origin:{resolved_origin}"))
+    if resolved_origin == "server_edge":
+        norm_tags.append(normalize_tag("edge"))
+    elif resolved_origin == "device_offline":
+        norm_tags.append(normalize_tag("local"))
+    if device_obj:
+        norm_tags.append(normalize_tag(f"device:{device_obj.device_id}"))
+
+    # Remove empties and de-duplicate
+    norm_tags = sorted({t for t in norm_tags if t})
 
     # Persist
-    prob_map = {cls: float(p) for cls, p in zip(inference.class_names, probs)}
+    prob_map = {cls: float(p) for cls, p in zip(classes, probs)}
     ev = PredictionEvent(
-        user_id=user.id,
+        user_id=user.id if user else None,
         image_path=rel_path,
         predicted_label=predicted_class,
         predicted_confidence=float(top_conf),
         probabilities=prob_map,
         crop=crop,  # enforce non-null
         tags=norm_tags,
+        origin=resolved_origin,
+        device_id=device_obj.device_id if device_obj else None,
+        device_local_timestamp=parsed_device_ts,
     )
     db.add(ev)
+    if device_obj:
+        device_obj.last_seen = datetime.utcnow()
+        db.add(device_obj)
     db.commit()
     db.refresh(ev)
 
@@ -98,9 +206,109 @@ def predict(
         id=ev.id,
         predicted_class=predicted_class,
         confidence=float(top_conf),
-        classes=inference.class_names,
+    classes=classes,
         probabilities=[float(p) for p in probs],
         image_url=f"/media/{rel_path}",
+        origin=cast(OriginLiteral, resolved_origin),
+        device_id=device_obj.device_id if device_obj else None,
+        device_local_timestamp=ev.device_local_timestamp,
+        tags=ev.tags or [],
+    )
+
+
+@router.post("/devices/{device_id}/predictions", response_model=PredictionResponse)
+def sync_device_prediction(
+    device_id: str,
+    file: UploadFile = File(...),
+    predicted_label: str = Form(..., description="Predicted class label (e.g., Crop___Disease)"),
+    predicted_confidence: float = Form(..., description="Confidence score for the predicted label"),
+    probabilities_json: Optional[str] = Form(
+        None,
+        description="Optional JSON object mapping class labels to probabilities",
+    ),
+    tags: Optional[List[str]] = Form(None, description="Optional list of tags"),
+    device_local_timestamp: Optional[str] = Form(
+        None, description="ISO-8601 timestamp when prediction was computed on device"
+    ),
+    db: Session = Depends(get_db),
+    device=Depends(require_device),
+):
+    if device.device_id != device_id:
+        raise HTTPException(status_code=403, detail="Device credential mismatch")
+
+    settings = get_settings()
+    classes = ensure_model_classes(settings)
+
+    # Persist uploaded image
+    rel_path = save_upload(settings.media_root, file)
+
+    parsed_device_ts = parse_device_timestamp(device_local_timestamp)
+
+    crop, _ = parse_crop_disease(predicted_label)
+    if crop is None:
+        raise HTTPException(
+            status_code=400,
+            detail="predicted_label must include crop (format 'Crop___Disease')",
+        )
+
+    prob_map = parse_probabilities_json(probabilities_json)
+    if not prob_map:
+        prob_map = {predicted_label: float(predicted_confidence)}
+    else:
+        prob_map.setdefault(predicted_label, float(predicted_confidence))
+
+    probabilities_dict = {k: float(v) for k, v in prob_map.items()}
+
+    norm_tags: list[str] = []
+    if tags:
+        for t in tags:
+            nt = normalize_tag(t)
+            if nt:
+                norm_tags.append(nt)
+
+    norm_tags.append(normalize_tag("origin:device_offline"))
+    norm_tags.append(normalize_tag("local"))
+    norm_tags.append(normalize_tag(f"device:{device.device_id}"))
+    norm_tags = sorted({t for t in norm_tags if t})
+
+    event_kwargs = dict(
+        image_path=rel_path,
+        predicted_label=predicted_label,
+        predicted_confidence=float(predicted_confidence),
+        probabilities=probabilities_dict,
+        crop=crop,
+        tags=norm_tags,
+        origin="device_offline",
+        device_id=device.device_id,
+        device_local_timestamp=parsed_device_ts,
+    )
+    if parsed_device_ts is not None:
+        event_kwargs["created_at"] = parsed_device_ts
+
+    ev = PredictionEvent(**event_kwargs)
+    db.add(ev)
+
+    device.last_seen = datetime.utcnow()
+    db.add(device)
+
+    db.commit()
+    db.refresh(ev)
+
+    probabilities_list = [float(probabilities_dict.get(cls, 0.0)) for cls in classes]
+    if not classes:
+        probabilities_list = [float(v) for v in probabilities_dict.values()]
+
+    return PredictionResponse(
+        id=ev.id,
+        predicted_class=predicted_label,
+        confidence=float(predicted_confidence),
+        classes=classes,
+        probabilities=probabilities_list,
+        image_url=f"/media/{rel_path}",
+        origin=cast(OriginLiteral, "device_offline"),
+        device_id=device.device_id,
+        device_local_timestamp=ev.device_local_timestamp,
+        tags=ev.tags or [],
     )
 
 @router.post("/predictions/{prediction_id}/feedback")
@@ -155,6 +363,8 @@ def history(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     confirmed: Optional[bool] = Query(None, description="True=only confirmed, False=only unconfirmed, None=all"),
+    origin: Optional[str] = Query(None, description="Filter by origin"),
+    device_id_filter: Optional[str] = Query(None, alias="device_id"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -186,6 +396,14 @@ def history(
     elif confirmed is False:
         q = q.filter(or_(PredictionEvent.confirmed.is_(False), PredictionEvent.confirmed.is_(None)))
 
+    if origin:
+        if origin not in ALLOWED_ORIGINS:
+            raise HTTPException(status_code=400, detail="Invalid origin filter")
+        q = q.filter(PredictionEvent.origin == origin)
+
+    if device_id_filter:
+        q = q.filter(PredictionEvent.device_id == device_id_filter)
+
     if tags:
         norm = [normalize_tag(t) for t in tags if normalize_tag(t)]
         if norm:
@@ -213,6 +431,9 @@ def history(
                 image_url=f"/media/{ev.image_path}",
                 crop=ev.crop,
                 tags=ev.tags or [],
+                origin=cast(OriginLiteral, ev.origin or "server_web"),
+                device_id=ev.device_id,
+                device_local_timestamp=ev.device_local_timestamp,
             )
             for ev in rows
         ],
@@ -252,6 +473,9 @@ def review_queue(
                 image_url=f"/media/{ev.image_path}",
                 crop=ev.crop,
                 tags=ev.tags or [],
+                origin=cast(OriginLiteral, ev.origin or "server_web"),
+                device_id=ev.device_id,
+                device_local_timestamp=ev.device_local_timestamp,
             )
             for ev in rows
         ],

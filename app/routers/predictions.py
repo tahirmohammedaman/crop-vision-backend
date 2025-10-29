@@ -226,7 +226,7 @@ def review_queue(
     user=Depends(get_current_user),
 ):
     base = db.query(PredictionEvent).filter(
-        PredictionEvent.predicted_confidence < 0.80,
+        PredictionEvent.predicted_confidence < 0.90,
         or_(PredictionEvent.confirmed.is_(False), PredictionEvent.confirmed.is_(None)),
     )
 

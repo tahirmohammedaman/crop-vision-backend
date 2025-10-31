@@ -5,7 +5,7 @@ import mimetypes
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Form
 from fastapi.responses import JSONResponse, FileResponse
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import or_, func
+from sqlalchemy import or_, func, Text
 from PIL import Image
 import os
 import re
@@ -497,7 +497,7 @@ def history(
         if term:
             pattern = f"%{term.lower()}%"
             tag_expr = func.lower(
-                func.coalesce(func.array_to_string(PredictionEvent.tags, ","), "")
+                func.coalesce(PredictionEvent.tags.cast(Text), "")
             )
             q = q.filter(
                 or_(

@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
 from typing import List, Optional, cast
 import json
+import mimetypes
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Form
-from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from fastapi.responses import JSONResponse, FileResponse
+from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import or_, func
 from PIL import Image
 import os
 import re
@@ -23,6 +24,7 @@ from ..models.device import Device
 from ..schemas.prediction import (
     PredictionResponse,
     PredictionHistoryItem,
+    PredictionHistoryUser,
     FeedbackRequest,
     PaginatedResponse,
     OriginLiteral,
@@ -33,6 +35,7 @@ router = APIRouter(prefix="/v1", tags=["predictions"])
 TAG_CLEAN_RE = re.compile(r"[^a-z0-9\-:]+")
 ALLOWED_ORIGINS = {"server_web", "server_edge", "device_offline"}
 
+
 def normalize_tag(s: str) -> str:
     if s is None:
         return ""
@@ -41,6 +44,7 @@ def normalize_tag(s: str) -> str:
     t = re.sub(r"-{2,}", "-", t).strip("-")
     t = TAG_CLEAN_RE.sub("", t)
     return t
+
 
 def parse_crop_disease(label: str) -> tuple[Optional[str], Optional[str]]:
     # Expected formats like "Tomato___Late_blight", "Apple___healthy", etc.
@@ -55,7 +59,9 @@ def parse_crop_disease(label: str) -> tuple[Optional[str], Optional[str]]:
     return crop, disease
 
 
-def parse_device_timestamp(value: Optional[str], field_name: str = "device_local_timestamp") -> Optional[datetime]:
+def parse_device_timestamp(
+    value: Optional[str], field_name: str = "device_local_timestamp"
+) -> Optional[datetime]:
     if not value:
         return None
     ts_value = value.strip()
@@ -66,7 +72,9 @@ def parse_device_timestamp(value: Optional[str], field_name: str = "device_local
     try:
         parsed = datetime.fromisoformat(ts_value)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"{field_name} must be ISO-8601") from exc
+        raise HTTPException(
+            status_code=400, detail=f"{field_name} must be ISO-8601"
+        ) from exc
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
     return parsed
@@ -78,17 +86,25 @@ def parse_probabilities_json(value: Optional[str]) -> dict[str, float]:
     try:
         raw = json.loads(value)
     except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail="probabilities_json must be valid JSON object") from exc
+        raise HTTPException(
+            status_code=400, detail="probabilities_json must be valid JSON object"
+        ) from exc
     if not isinstance(raw, dict):
-        raise HTTPException(status_code=400, detail="probabilities_json must be an object")
+        raise HTTPException(
+            status_code=400, detail="probabilities_json must be an object"
+        )
     prob_map: dict[str, float] = {}
     for key, val in raw.items():
         if not isinstance(key, str):
-            raise HTTPException(status_code=400, detail="probabilities_json keys must be strings")
+            raise HTTPException(
+                status_code=400, detail="probabilities_json keys must be strings"
+            )
         try:
             prob_map[key] = float(val)
         except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid probability for class '{key}'") from exc
+            raise HTTPException(
+                status_code=400, detail=f"Invalid probability for class '{key}'"
+            ) from exc
     return prob_map
 
 
@@ -96,6 +112,44 @@ def ensure_model_classes(settings) -> List[str]:
     model_path = os.path.join(settings.models_path, settings.model_file)
     inference.ensure_loaded(model_path)
     return getattr(inference, "class_names", []) or []
+
+
+def _serialize_prediction_events(
+    events: List[PredictionEvent],
+) -> List[PredictionHistoryItem]:
+    items: List[PredictionHistoryItem] = []
+    for ev in events:
+        prob_map = {
+            str(label): float(value)
+            for label, value in (ev.probabilities or {}).items()
+        }
+        user_summary = None
+        if ev.user:
+            user_summary = PredictionHistoryUser(
+                id=ev.user.id, username=ev.user.username
+            )
+        items.append(
+            PredictionHistoryItem(
+                id=ev.id,
+                created_at=ev.created_at,
+                predicted_label=ev.predicted_label,
+                predicted_confidence=ev.predicted_confidence,
+                corrected_label=ev.corrected_label,
+                confirmed=ev.confirmed,
+                confirmed_at=ev.confirmed_at,
+                image_url=f"/media/{ev.image_path}",
+                crop=ev.crop,
+                tags=ev.tags or [],
+                origin=cast(OriginLiteral, ev.origin or "server_web"),
+                device_id=ev.device_id,
+                device_local_timestamp=ev.device_local_timestamp,
+                probabilities=prob_map,
+                user_id=ev.user_id,
+                user=user_summary,
+            )
+        )
+    return items
+
 
 @router.post("/predict", response_model=PredictionResponse)
 def predict(
@@ -127,7 +181,9 @@ def predict(
     crop, _disease = parse_crop_disease(predicted_class)
     if crop is None:
         # This should never happen if class names use "Crop___Disease" format
-        raise HTTPException(status_code=500, detail="Unable to parse crop from predicted class")
+        raise HTTPException(
+            status_code=500, detail="Unable to parse crop from predicted class"
+        )
 
     # Determine auth context
     if not user and not device:
@@ -206,7 +262,7 @@ def predict(
         id=ev.id,
         predicted_class=predicted_class,
         confidence=float(top_conf),
-    classes=classes,
+        classes=classes,
         probabilities=[float(p) for p in probs],
         image_url=f"/media/{rel_path}",
         origin=cast(OriginLiteral, resolved_origin),
@@ -220,8 +276,12 @@ def predict(
 def sync_device_prediction(
     device_id: str,
     file: UploadFile = File(...),
-    predicted_label: str = Form(..., description="Predicted class label (e.g., Crop___Disease)"),
-    predicted_confidence: float = Form(..., description="Confidence score for the predicted label"),
+    predicted_label: str = Form(
+        ..., description="Predicted class label (e.g., Crop___Disease)"
+    ),
+    predicted_confidence: float = Form(
+        ..., description="Confidence score for the predicted label"
+    ),
     probabilities_json: Optional[str] = Form(
         None,
         description="Optional JSON object mapping class labels to probabilities",
@@ -311,6 +371,7 @@ def sync_device_prediction(
         tags=ev.tags or [],
     )
 
+
 @router.post("/predictions/{prediction_id}/feedback")
 def feedback(
     prediction_id: int,
@@ -328,7 +389,9 @@ def feedback(
         if not ev.crop:
             pred_crop, _ = parse_crop_disease(ev.predicted_label)
             if pred_crop is None:
-                raise HTTPException(status_code=500, detail="Unable to parse crop from predicted label")
+                raise HTTPException(
+                    status_code=500, detail="Unable to parse crop from predicted label"
+                )
             ev.crop = pred_crop
     else:
         if not data.corrected_label:
@@ -342,7 +405,10 @@ def feedback(
         # Always set crop from corrected label; must not be null
         crop, _ = parse_crop_disease(data.corrected_label)
         if crop is None:
-            raise HTTPException(status_code=400, detail="corrected_label must include crop (format 'Crop___Disease')")
+            raise HTTPException(
+                status_code=400,
+                detail="corrected_label must include crop (format 'Crop___Disease')",
+            )
         ev.confirmed = True
         ev.corrected_label = data.corrected_label
         ev.crop = crop
@@ -350,6 +416,7 @@ def feedback(
     db.add(ev)
     db.commit()
     return JSONResponse({"status": "ok"})
+
 
 @router.get("/history", response_model=PaginatedResponse[PredictionHistoryItem])
 def history(
@@ -362,24 +429,35 @@ def history(
     max_confidence: float = Query(1.0, ge=0.0, le=1.0),
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
-    confirmed: Optional[bool] = Query(None, description="True=only confirmed, False=only unconfirmed, None=all"),
+    confirmed: Optional[bool] = Query(
+        None, description="True=only confirmed, False=only unconfirmed, None=all"
+    ),
     origin: Optional[str] = Query(None, description="Filter by origin"),
     device_id_filter: Optional[str] = Query(None, alias="device_id"),
+    search: Optional[str] = Query(
+        None,
+        description="Wildcard search across crop, disease, tags, or device id",
+    ),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    q = db.query(PredictionEvent)
+    q = db.query(PredictionEvent).options(selectinload(PredictionEvent.user))
 
     if crop:
         q = q.filter(PredictionEvent.crop == crop)
 
     if disease:
-        q = q.filter(
-            or_(
-                PredictionEvent.predicted_label == disease,
-                PredictionEvent.corrected_label == disease,
+        term = disease.strip().lower()
+        if term:
+            pattern = f"%{term}%"
+            # match when predicted or corrected label ends with the disease term (case-insensitive)
+            pattern = f"%{term}"
+            q = q.filter(
+                or_(
+                    func.lower(PredictionEvent.predicted_label).like(pattern),
+                    func.lower(PredictionEvent.corrected_label).like(pattern),
+                )
             )
-        )
 
     if start_date:
         q = q.filter(PredictionEvent.created_at >= start_date)
@@ -394,7 +472,12 @@ def history(
     if confirmed is True:
         q = q.filter(PredictionEvent.confirmed.is_(True))
     elif confirmed is False:
-        q = q.filter(or_(PredictionEvent.confirmed.is_(False), PredictionEvent.confirmed.is_(None)))
+        q = q.filter(
+            or_(
+                PredictionEvent.confirmed.is_(False),
+                PredictionEvent.confirmed.is_(None),
+            )
+        )
 
     if origin:
         if origin not in ALLOWED_ORIGINS:
@@ -409,35 +492,32 @@ def history(
         if norm:
             q = q.filter(PredictionEvent.tags.contains(norm))
 
+    if search:
+        term = search.strip()
+        if term:
+            pattern = f"%{term.lower()}%"
+            tag_expr = func.lower(
+                func.coalesce(func.array_to_string(PredictionEvent.tags, ","), "")
+            )
+            q = q.filter(
+                or_(
+                    func.lower(PredictionEvent.crop).like(pattern),
+                    func.lower(PredictionEvent.predicted_label).like(pattern),
+                    func.lower(PredictionEvent.corrected_label).like(pattern),
+                    func.lower(PredictionEvent.device_id).like(pattern),
+                    tag_expr.like(pattern),
+                )
+            )
+
     total = q.count()
 
-    rows = (
-        q.order_by(PredictionEvent.id.desc())
-         .offset(skip)
-         .limit(limit)
-         .all()
-    )
+    rows = q.order_by(PredictionEvent.id.desc()).offset(skip).limit(limit).all()
 
     return {
         "total": total,
-        "items": [
-            PredictionHistoryItem(
-                id=ev.id,
-                created_at=ev.created_at,
-                predicted_label=ev.predicted_label,
-                predicted_confidence=ev.predicted_confidence,
-                corrected_label=ev.corrected_label,
-                confirmed=ev.confirmed,
-                image_url=f"/media/{ev.image_path}",
-                crop=ev.crop,
-                tags=ev.tags or [],
-                origin=cast(OriginLiteral, ev.origin or "server_web"),
-                device_id=ev.device_id,
-                device_local_timestamp=ev.device_local_timestamp,
-            )
-            for ev in rows
-        ],
+        "items": _serialize_prediction_events(rows),
     }
+
 
 @router.get("/review/queue", response_model=PaginatedResponse[PredictionHistoryItem])
 def review_queue(
@@ -446,40 +526,58 @@ def review_queue(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    base = db.query(PredictionEvent).filter(
-        PredictionEvent.predicted_confidence < 0.90,
-        or_(PredictionEvent.confirmed.is_(False), PredictionEvent.confirmed.is_(None)),
+    base = (
+        db.query(PredictionEvent)
+        .options(selectinload(PredictionEvent.user))
+        .filter(
+            PredictionEvent.predicted_confidence < 0.90,
+            or_(
+                PredictionEvent.confirmed.is_(False),
+                PredictionEvent.confirmed.is_(None),
+            ),
+        )
     )
 
     total = base.count()
 
     rows = (
-        base.order_by(PredictionEvent.predicted_confidence.asc(), PredictionEvent.id.desc())
-            .offset(skip)
-            .limit(limit)
-            .all()
+        base.order_by(
+            PredictionEvent.predicted_confidence.asc(), PredictionEvent.id.desc()
+        )
+        .offset(skip)
+        .limit(limit)
+        .all()
     )
 
     return {
         "total": total,
-        "items": [
-            PredictionHistoryItem(
-                id=ev.id,
-                created_at=ev.created_at,
-                predicted_label=ev.predicted_label,
-                predicted_confidence=ev.predicted_confidence,
-                corrected_label=ev.corrected_label,
-                confirmed=ev.confirmed,
-                image_url=f"/media/{ev.image_path}",
-                crop=ev.crop,
-                tags=ev.tags or [],
-                origin=cast(OriginLiteral, ev.origin or "server_web"),
-                device_id=ev.device_id,
-                device_local_timestamp=ev.device_local_timestamp,
-            )
-            for ev in rows
-        ],
+        "items": _serialize_prediction_events(rows),
     }
+
+
+@router.get("/media/{image_path:path}")
+def get_uploaded_image(
+    image_path: str,
+    _user=Depends(get_current_user),
+):
+    settings = get_settings()
+    media_root = os.path.abspath(settings.media_root)
+    candidate = os.path.abspath(os.path.join(media_root, image_path))
+
+    try:
+        common = os.path.commonpath([media_root, candidate])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid media path")
+
+    if common != media_root:
+        raise HTTPException(status_code=400, detail="Invalid media path")
+
+    if not os.path.isfile(candidate):
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    media_type, _ = mimetypes.guess_type(candidate)
+    return FileResponse(candidate, media_type=media_type or "application/octet-stream")
+
 
 @router.get("/tags", response_model=List[str])
 def all_tags(
@@ -497,6 +595,7 @@ def all_tags(
                 seen.add(normalize_tag(t))
     return sorted(seen)
 
+
 @router.get("/crops", response_model=List[str])
 def all_crops(
     db: Session = Depends(get_db),
@@ -513,9 +612,14 @@ def all_crops(
             crops.add(crop)
     if not crops:
         # fallback to DB crops
-        for (c,) in db.query(PredictionEvent.crop).filter(PredictionEvent.crop.isnot(None)).distinct():
+        for (c,) in (
+            db.query(PredictionEvent.crop)
+            .filter(PredictionEvent.crop.isnot(None))
+            .distinct()
+        ):
             crops.add(c)
     return sorted(crops)
+
 
 @router.get("/diseases", response_model=List[str])
 def all_diseases(
@@ -538,7 +642,11 @@ def all_diseases(
             _c, d = parse_crop_disease(pl)
             if d:
                 diseases.add(d)
-        for (cl,) in db.query(PredictionEvent.corrected_label).filter(PredictionEvent.corrected_label.isnot(None)).distinct():
+        for (cl,) in (
+            db.query(PredictionEvent.corrected_label)
+            .filter(PredictionEvent.corrected_label.isnot(None))
+            .distinct()
+        ):
             _c, d = parse_crop_disease(cl)
             if d:
                 diseases.add(d)

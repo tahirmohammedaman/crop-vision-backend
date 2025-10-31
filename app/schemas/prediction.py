@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional, List, Generic, TypeVar, Literal
+from typing import Optional, List, Generic, TypeVar, Literal, Dict
 from pydantic import BaseModel, Field
 from pydantic.generics import GenericModel
 
@@ -20,6 +20,11 @@ class PredictionResponse(BaseModel):
     tags: List[str] = Field(default_factory=list)
 
 
+class PredictionHistoryUser(BaseModel):
+    id: int
+    username: str
+
+
 class PredictionHistoryItem(BaseModel):
     id: int
     created_at: datetime
@@ -33,6 +38,10 @@ class PredictionHistoryItem(BaseModel):
     origin: OriginLiteral
     device_id: Optional[str] = None
     device_local_timestamp: Optional[datetime] = None
+    confirmed_at: Optional[datetime] = None
+    probabilities: Dict[str, float] = Field(default_factory=dict)
+    user_id: Optional[int] = None
+    user: Optional[PredictionHistoryUser] = None
 
 
 class PaginatedResponse(GenericModel, Generic[T]):

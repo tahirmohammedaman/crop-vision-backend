@@ -24,4 +24,4 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
         algorithm=settings.algorithm,
         expires_minutes=settings.access_token_expire_minutes,
     )
-    return Token(access_token=token)
+    return Token(access_token=token, username=user.username)
